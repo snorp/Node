@@ -15,6 +15,7 @@ enum CommandOp {
   CMD_OP_POLL,          // request the node send all status information
   CMD_OP_RESET,         // do a factory reset!
   CMD_OP_FLASH_IMAGE,   // begin flashing a new image!
+  CMD_OP_ACK,
 
   // Commands for blinds control
   CMD_OP_BLINDS_POSITION = 50, // set or notify blinds position, which an index 0-2
