@@ -35,4 +35,10 @@ static void printDebug(const __FlashStringHelper *pgmFmt, ...)
 
 #endif
 
+#ifdef NODE_DEBUG_ABORT
+#define DEBUG_ABORT(fmt, ...) Serial.print("*** ABORT: "); DEBUG(fmt, ##__VA_ARGS__); Serial.flush(); abort();
+#else
+#define DEBUG_ABORT(fmt, ...) DEBUG(fmt, ##__VA_ARGS__);
+#endif
+
 #endif // Debug_h__
