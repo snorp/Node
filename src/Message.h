@@ -10,7 +10,7 @@ struct Message {
   Command cmd;
 
   bool isBroadcast(void) {
-    return from == RF69_BROADCAST_ADDR;
+    return from == RF69_BROADCAST_ADDR || to == RF69_BROADCAST_ADDR;
   }
 };
 

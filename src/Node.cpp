@@ -14,10 +14,13 @@
 
 #define WAKE_DURATION 5000 // 5s
 
-#define REPLY_TIMEOUT 1200
-#define NUM_RETRIES 5
+#define BURST_REPLY_TIMEOUT 2000
+#define BURST_WAIT_PADDING 15
+#define BURST_DURATION_MS 1200
+#define NUM_RETRIES 3
+#define ACK_TIMEOUT 200
 
-#define LISTEN_RX_DURATION 256
+#define LISTEN_RX_DURATION 512
 #define LISTEN_IDLE_DURATION 1000000
 
 #define BATTERY_MAX_V 68
@@ -66,6 +69,13 @@ static void toggleLED(void)
   pinMode(LED_PIN, OUTPUT);
   status = status == LOW ? HIGH : LOW;
   digitalWrite(LED_PIN, status);
+}
+
+static void blinkLED(void)
+{
+  digitalWrite(LED_PIN, HIGH);
+  delay(50);
+  digitalWrite(LED_PIN, LOW);
 }
 
 #define IMAGE_HEADER_LENGTH 10 // FLXIMG:NN:
@@ -191,24 +201,18 @@ void Node::setup(int defaultAddress, int networkId, uint32_t settingsAddress,
   _batteryPin = 0xff;
 
   DEBUG("Build: " __DATE__ ", " __TIME__);
-  if (hasFlash) {
-    DEBUG("Initializing flash...");
-    if (_flash.initialize()) {
-      _flash.sleep();
-    }
-  }
+
+  memset(_wakeStates, 0, MAX_NODES * sizeof(bool));
+  memset(_listeners, 0, MAX_MESSAGE_LISTENERS * sizeof(MessageListener));
 
   if (!readSettings()) {
     _settings.address = defaultAddress;
     writeSettings();
   }
 
-  memset(_wakeStates, 0, MAX_NODES * sizeof(bool));
-  memset(_listeners, 0, MAX_MESSAGE_LISTENERS * sizeof(MessageListener));
-
-  _sleepNotifyAddress = 0;
-
+  DEBUG("Initializing radio...");
   _radio.initialize(RF69_433MHZ, address(), networkId);
+  _radio.setHighSpeedListen(false);
   _radio.encrypt(encryptKey);
 
   uint32_t rxDuration = LISTEN_RX_DURATION;
@@ -216,9 +220,22 @@ void Node::setup(int defaultAddress, int networkId, uint32_t settingsAddress,
   _radio.setListenDurations(rxDuration, idleDuration);
 
   DEBUG("RX duration: %luus, idle duration: %luus", rxDuration, idleDuration);
+  _radio.sleep();
+
+  delay(200);
+
+  if (hasFlash) {
+    DEBUG("Initializing flash...");
+    if (_flash.initialize()) {
+      _flash.sleep();
+    }
+  }
 
   _wokeMillis = 0;
   _addressChanged = false;
+
+  pinMode(LED_PIN, OUTPUT);
+  blinkLED();
 }
 
 void Node::setBatteryParams(uint8_t pin, int maxVoltage, int minVoltage, float ratio)
@@ -238,30 +255,39 @@ bool Node::isMessageForMe(Message& msg)
     (msg.isBroadcast() && (msg.cmd.group == group() || msg.cmd.group == 0));
 }
 
-void Node::handleMessage(Message& msg)
+void Node::handleMessage(Message& msg, bool ackRequested)
 {
   if (msg.cmd.flags & CMD_FLAG_WILL_SLEEP) {
     DEBUG("Node %u will sleep", msg.from);
 
     // The sender is going to sleep immediately, so mark it as such
     _wakeStates[msg.from] = false;
+  } else {
+    _wakeStates[msg.from] = true;
   }
 
   if (msg.cmd.flags & CMD_FLAG_STAY_AWAKE) {
     DEBUG("Node %u requested we stay awake", msg.from);
-
-    // This node asked us to stay awake, so let them know when we aren't anymore
-    _sleepNotifyAddress = msg.from;
     bump();
   }
 
-  // We are receiving a message, so unbump
-  unbump();
+  // We are receiving a (non-ACK) message, so unbump
+  if (msg.cmd.op != CMD_OP_ACK) {
+    if (!(msg.cmd.flags & CMD_FLAG_STAY_AWAKE)) {
+      unbump();
+    }
+
+    if (ackRequested) {
+      sendACK();
+    }
+  }
 
   switch (msg.cmd.op) {
-    case CMD_OP_PING:
+    case CMD_OP_PING: {
       DEBUG("Received ping from %u", msg.from);
+      blinkLED();
       break;
+    }
     case CMD_OP_SLEEPING:
       _wakeStates[msg.from] = false;
       break;
@@ -289,6 +315,7 @@ void Node::handleMessage(Message& msg)
       break;
     case CMD_OP_CLASS:
       // You cannot change the device class remotely, so this is only used to request the value
+      DEBUG("Sending device class");
       sendDeviceClass(msg.from, true);
       break;
     case CMD_OP_REASSIGN:
@@ -317,9 +344,9 @@ void Node::handleMessage(Message& msg)
 
 void Node::dispatchMessage(Message& msg)
 {
+  DEBUG("Dispatching message from %u with op %u", msg.from, msg.cmd.op);
   for (int i = 0; i < MAX_MESSAGE_LISTENERS; i++) {
     if (_listeners[i]) {
-      DEBUG("Dispatching message to listener %d", i);
       _listeners[i](msg);
     }
   }
@@ -357,87 +384,128 @@ void Node::reboot(void)
   }
 }
 
-bool Node::receiveMessage(Message& msg)
+void Node::sendACK(void)
 {
-  if (_radio.receiveDone() && _radio.DATALEN == sizeof(Command)) {
-    DEBUG("Received a message, op = %u", msg.cmd.op);
+  pause();
+  DEBUG("Sending Node ACK");
+  Command ackCommand(CMD_OP_ACK);
+  ackCommand.flags = needSleep() ? CMD_FLAG_WILL_SLEEP : 0;
+  _radio.sendACK(&ackCommand, sizeof(ackCommand));
+}
 
+bool Node::retrieveMessage(Message& msg, bool *needACK)
+{
+  if (_radio.DATALEN == sizeof(Command)) {
     noInterrupts();
     msg.from = _radio.SENDERID;
     msg.to = _radio.TARGETID;
 
     memcpy(&msg.cmd, (void*)_radio.DATA, sizeof(Command));
-    bool needACK = _radio.ACKRequested();
-    interrupts();
-
-    if (!isMessageForMe(msg)) {
-      return false;
-    }
-
     if (needACK) {
-      _radio.sendACK();
+      *needACK = _radio.ACKRequested();
     }
 
-    handleMessage(msg);
+    interrupts();
     return true;
   }
 
   return false;
 }
 
+bool Node::receiveMessage(Message& msg)
+{
+  if (!_radio.receiveDone()) {
+    return false;
+  }
+
+  bool needACK;
+  if (!retrieveMessage(msg, &needACK)) {
+    DEBUG_ABORT("Received a message, but it was not formatted correctly?");
+    return false;
+  }
+
+  if (!isMessageForMe(msg)) {
+    DEBUG("Received a message, but it was not for me");
+    return false;
+  }
+
+  DEBUG("Received a message from %u, RSSI = %d, op = %u", msg.from, _radio.RSSI, msg.cmd.op);
+
+  handleMessage(msg, needACK);
+  return true;
+}
+
+bool Node::sendRawWithRetry(uint8_t to, void *buf, size_t length)
+{
+  pause();
+  bool success = _radio.sendWithRetry(to, buf, length, NUM_RETRIES, ACK_TIMEOUT);
+  if (success) {
+    DEBUG("Successfully sent raw message, processing ACK");
+
+    Message ackMessage;
+    if (retrieveMessage(ackMessage)) {
+      DEBUG("Got a Node ACK");
+      handleMessage(ackMessage, false);
+    } else {
+      DEBUG_ABORT("Failed to retrieve Node ACK!");
+    }
+  } else {
+    DEBUG_ABORT("Failed to send raw message");
+  }
+
+  return success;
+}
+
 bool Node::sendMessage(Message& msg)
 {
-  if (needSleep() && address() != GATEWAY_ADDRESS) {
+  if (needSleep()) {
     // It's very likely we'll go to sleep after sending this, so make sure
     // the flag is set
     msg.cmd.flags |= CMD_FLAG_WILL_SLEEP;
   }
 
-  if (msg.to != GATEWAY_ADDRESS && !_wakeStates[msg.to]) {
-    // The remote node is asleep, so we're going to send a burst to wake it up.
-    // Once it responds, we'll send the real message. For broadcast messages
-    // we do not get a reply, instead we just send it in the blind.
-    Command burstCmd(CMD_OP_PING);
-    burstCmd.group = msg.cmd.group;
-
-    _radio.sendBurst(msg.to, &burstCmd, sizeof(Command));
+  if (msg.isBroadcast() || (msg.to != GATEWAY_ADDRESS && !_wakeStates[msg.to])) {
+    DEBUG("Sending burst message...");
+    _radio.sendBurst(msg.to, &msg.cmd, sizeof(Command), BURST_DURATION_MS);
 
     if (msg.isBroadcast()) {
-      // We don't wait on a reply with broadcast messages
-      pause();
-
-      // Send the real message now
-      _radio.send(msg.to, &msg.cmd, sizeof(Command));
       return true;
     }
 
-    DEBUG("Sent burst, waiting for reply...");
+    DEBUG("%lu: Sent burst, waiting for ACK...", millis());
 
     Message reply;
-    uint32_t wait = millis() + REPLY_TIMEOUT;
-    bool gotWoke = false;
+    uint32_t wait = millis() + BURST_REPLY_TIMEOUT;
+    bool gotACK = false;
     while (millis() < wait) {
-      if (receiveMessage(reply) && reply.from == msg.to && reply.cmd.op == CMD_OP_WOKE) {
-        gotWoke = true;
+      if (!receiveMessage(reply)) {
+        continue;
+      }
+
+      DEBUG("%lu: Received message while waiting for burst ACK", millis());
+
+      if (reply.from == msg.to && reply.cmd.op == CMD_OP_ACK) {
+        gotACK = true;
         break;
       }
     }
 
-    DEBUG("Got burst reply? %d", gotWoke);
-
     // Timeout waiting on burst ack, probably not received
-    if (!gotWoke) {
+    if (!gotACK) {
+      DEBUG_ABORT("%lu: Timed out waiting on burst ACK", millis());
       return false;
     }
 
-    pause();
+    // if (!(reply.flags & CMD_FLAG_WILL_SLEEP)) {
+    //   _wakeStates[msg.to] = true;
+    // }
 
-    // If we get here then we are presuming the remote node to be awake. Send the real message.
-    return _radio.sendWithRetry(msg.to, &msg.cmd, sizeof(Command), NUM_RETRIES);
+    DEBUG("Got burst ACK");
+    return true;
   }
 
   DEBUG("Sending non-burst message");
-  bool sent = _radio.sendWithRetry(msg.to, &msg.cmd, sizeof(Command), NUM_RETRIES);
+  bool sent = sendRawWithRetry(msg.to, &msg.cmd, sizeof(Command));
   if (!sent) {
     DEBUG("Failed to send message!");
     if (msg.to != GATEWAY_ADDRESS) {
@@ -490,6 +558,10 @@ void Node::unbump(void)
 
 bool Node::needSleep(void)
 {
+  if (address() == GATEWAY_ADDRESS) {
+    return false;
+  }
+
   return _bumps == 0 || (_wokeMillis > 0 && (millis() - _wokeMillis) >= WAKE_DURATION);
 }
 
@@ -498,15 +570,9 @@ void Node::pause(void)
   LowPower.powerDown(SLEEP_15MS, ADC_OFF, BOD_OFF);
 }
 
-void Node::sleep(period_t period)
+bool Node::sleep(Message& msg, period_t period)
 {
   _bumps = 0;
-
-  // Tell the node that woke us that we're going to sleep
-  if (_sleepNotifyAddress) {
-    sendMessage(_sleepNotifyAddress, CMD_OP_SLEEPING);
-    _sleepNotifyAddress = 0;
-  }
 
   // Our address may have changed, set it now
   if (_addressChanged) {
@@ -527,37 +593,30 @@ void Node::sleep(period_t period)
 
   DEBUG("Woke up!");
 
-  _sleepNotifyAddress = 0;
-
   // We woke up, bring the radio out of listen mode
   if (_radio.endListening() && _radio.DATALEN == sizeof(Command)) {
     // We have a message. We don't care what it is other than whether or not
     // it actually applies to us. The message we receive here is unencrypted
     // so we only use this as an indication that someone wants to talk to us.
-    Message burstMsg;
-
-    noInterrupts();
-    burstMsg.from = _radio.SENDERID;
-    burstMsg.to = _radio.TARGETID;
-    memcpy(&burstMsg.cmd, (const void*)_radio.DATA, sizeof(Command));
-    interrupts();
-
-    if (!isMessageForMe(burstMsg)) {
-      DEBUG("Burst message is not for me");
-      return;
+    if (!retrieveMessage(msg)) {
+      DEBUG("Failed to retrieve burst message");
+      return false;
     }
 
-    // There is an implicit bump() if we are woken up from sleep
-    bump();
+    if (!isMessageForMe(msg)) {
+      DEBUG("Burst message is not for me (to=%u, group=%u)", msg.to, msg.cmd.group);
+      return false;
+    }
 
-    if (burstMsg.isBroadcast()) {
-      // We don't send WOKE for broadcast messages, so we don't need
+    if (msg.isBroadcast()) {
+      // We don't send an ACK for broadcast messages, so we don't need
       // to wait for that period to end.
-      return;
+      handleMessage(msg, false);
+      return true;
     }
 
-    // Message is specifically for us. We'll reply with WOKE after the
-    // burst timeout.
+    // Message is specifically for us. We will reply with ACK and then
+    // handle the message after waiting on the burst to end.
     DEBUG("Burst remaining %ums", _radio.LISTEN_BURST_REMAINING_MS);
 
     // We don't need the radio on while we wait on the burst to end
@@ -565,23 +624,28 @@ void Node::sleep(period_t period)
 
     // Wait until the remote side is done trying to wake us up, then reply
     // that we are awake
-    int32_t sleepRemaining = _radio.LISTEN_BURST_REMAINING_MS;
+    int32_t sleepRemaining = _radio.LISTEN_BURST_REMAINING_MS + BURST_WAIT_PADDING;
 
-    DEBUG("Waiting %dms to send WOKE", sleepRemaining);
+    DEBUG("Waiting %ldms to send ACK", sleepRemaining);
 
     while (sleepRemaining > 0) {
       LowPower.powerDown(SLEEP_60MS, ADC_OFF, BOD_OFF);
       sleepRemaining -= 60;
     }
 
-    if (sendMessage(burstMsg.from, CMD_OP_WOKE)) {
-      DEBUG("Sent WOKE message");
-    } else {
-      DEBUG("Failed to send WOKE");
-    }
+    DEBUG("Sending burst ACK");
+    Command ackCommand(CMD_OP_ACK);
+    ackCommand.flags = needSleep() ? CMD_FLAG_WILL_SLEEP : 0;
+    _radio.send(msg.from, &ackCommand, sizeof(Command));
+
+    handleMessage(msg, false);
+
+    return true;
   } else {
-    DEBUG("No message");
+    DEBUG("No message, DATALEN = %u", _radio.DATALEN);
   }
+
+  return false;
 }
 
 void Node::onMessage(MessageListener listener)
@@ -611,7 +675,7 @@ void Node::run(void)
     dispatchMessage(msg);
   }
 
-  if (needSleep()) {
-    sleep();
+  if (needSleep() && sleep(msg)) {
+    dispatchMessage(msg);
   }
 }

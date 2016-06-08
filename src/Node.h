@@ -62,6 +62,7 @@ public:
   bool receiveMessage(Message& msg);
   bool sendMessage(Message& msg);
   bool sendMessage(uint8_t to, CommandOp op, uint16_t arg1 = 0, uint16_t arg2 = 0, uint8_t flags = 0);
+
   void sendBroadcast(CommandOp op, uint16_t arg1 = 0, uint16_t arg2 = 0, uint8_t group = 0, uint8_t flags = 0);
 
   void bump(void);
@@ -71,7 +72,7 @@ public:
   void pause(void);
 
   // Returns true if we received a wakeup msg, false otherwise
-  void sleep(period_t period = SLEEP_FOREVER);
+  bool sleep(Message& msg, period_t period = SLEEP_FOREVER);
 
   void onMessage(MessageListener listener);
   void removeMessageListener(MessageListener listener);
@@ -92,9 +93,14 @@ protected:
   bool readSettings(void);
   void writeSettings(void);
 
+  bool retrieveMessage(Message& msg, bool *needACK = NULL);
+
   bool isMessageForMe(Message& msg);
-  void handleMessage(Message& msg);
+  void handleMessage(Message& msg, bool ackRequested);
   void dispatchMessage(Message& msg);
+
+  bool sendRawWithRetry(uint8_t to, void* buf, size_t length);
+  void sendACK(void);
 
   bool receiveFlashImage(uint16_t length, uint16_t crc);
 
@@ -111,7 +117,6 @@ protected:
   // Only used by nodes that wake other nodes (usually the gateway)
   bool _wakeStates[MAX_NODES];
   MessageListener _listeners[MAX_MESSAGE_LISTENERS];
-  uint8_t _sleepNotifyAddress;
   RFM69_WL _radio;
   SPIFlash _flash;
   uint8_t _bumps;
